@@ -1,12 +1,15 @@
 // Flow Debug key-license server
 //
 // Endpoints (bot-only ones require header "x-bot-secret" matching BOT_SECRET env var):
-//   POST /keys/generate   { nickname, duration, discordUserId } -> { key, nickname, expiresAt }
-//   POST /keys/terminate  { nickname, discordUserId }            -> { revokedCount, revokedKeys }
-//   POST /auth            { key, deviceId }  (called by the mod, no secret needed)
+//   POST /keys/generate      { nickname, duration, discordUserId } -> { key, nickname, expiresAt }
+//   POST /keys/terminate     { nickname, discordUserId }           -> { revokedCount, revokedKeys }
+//   POST /keys/revoke-by-key { key }                               -> { revoked: boolean }
+//   GET  /keys/status/:discordUserId                               -> { hasValidKey, plan, expiresAt, key }
+//   GET  /keys/list                                                -> full key dump (for the bot's expiry sweep)
+//   POST /auth                { key, deviceId }  (called by the mod, no secret needed)
 //
-// Storage is a single JSON file (keys.json) stored at /data (your Railway volume's
-// mount path), so it survives redeploys and restarts.
+// Storage is a single JSON file (keys.json) stored at /data (Railway volume mount path),
+// so it survives redeploys and restarts.
 
 const express = require("express");
 const fs = require("fs");
@@ -16,14 +19,8 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json());
 
-// Prefer the env var if it's actually there, otherwise fall back to the literal
-// mount path you set when creating the volume ("/data"). If neither directory
-// actually exists (e.g. testing locally with no volume at all), fall back to
-// the local folder so the server doesn't crash - it just won't be persistent
-// in that case.
 function resolveDataDir() {
     const candidates = [process.env.RAILWAY_VOLUME_MOUNT_PATH, "/data"].filter(Boolean);
-
     for (const dir of candidates) {
         try {
             if (fs.existsSync(dir)) return dir;
@@ -31,8 +28,7 @@ function resolveDataDir() {
             // ignore and try next candidate
         }
     }
-
-    console.warn("WARNING: Could not find /data or RAILWAY_VOLUME_MOUNT_PATH - falling back to local folder. keys.json will NOT persist across redeploys until the volume is actually mounted.");
+    console.warn("WARNING: Could not find /data or RAILWAY_VOLUME_MOUNT_PATH - falling back to local folder. keys.json will NOT persist across redeploys.");
     return __dirname;
 }
 
@@ -102,6 +98,19 @@ function requireBotSecret(req, res, next) {
     next();
 }
 
+// A key counts as "monthly" if it has an expiry, "lifetime" if it doesn't.
+// (Our system only ever issues "forever" or "1month" via the bot's UI, so this
+// simple rule is enough to tell the two apart without a separate stored field.)
+function planOf(entry) {
+    return entry.expiresAt === null ? "lifetime" : "monthly";
+}
+
+function isCurrentlyValid(entry) {
+    if (entry.revoked) return false;
+    if (entry.expiresAt && Date.now() > entry.expiresAt) return false;
+    return true;
+}
+
 // --- Generate a new key (bot only) ---
 app.post("/keys/generate", requireBotSecret, (req, res) => {
     const { nickname, duration, discordUserId } = req.body || {};
@@ -168,6 +177,66 @@ app.post("/keys/terminate", requireBotSecret, (req, res) => {
 
     writeKeys(keys);
     res.json({ revokedCount, revokedKeys });
+});
+
+// --- Revoke one specific key by its literal string (bot only) ---
+// Used for the upgrade flow (revoking the old monthly key specifically) and
+// the 7-day-unused sweep, where we need to revoke exactly one key rather
+// than "everything under this user".
+app.post("/keys/revoke-by-key", requireBotSecret, (req, res) => {
+    const { key } = req.body || {};
+
+    if (!key) return res.status(400).json({ error: "key is required" });
+
+    const keys = readKeys();
+    const entry = keys[key];
+
+    if (!entry) return res.status(404).json({ error: "not_found" });
+
+    const wasAlreadyRevoked = entry.revoked;
+    entry.revoked = true;
+    writeKeys(keys);
+
+    res.json({ revoked: !wasAlreadyRevoked });
+});
+
+// --- Look up a user's current best key status (bot only) ---
+// Prefers a lifetime key over a monthly one if a user somehow has both.
+app.get("/keys/status/:discordUserId", requireBotSecret, (req, res) => {
+    const { discordUserId } = req.params;
+    const keys = readKeys();
+
+    let best = null;
+    let bestKeyString = null;
+
+    for (const key of Object.keys(keys)) {
+        const entry = keys[key];
+        if (entry.createdFor !== discordUserId) continue;
+        if (!isCurrentlyValid(entry)) continue;
+
+        if (!best || (planOf(entry) === "lifetime" && planOf(best) !== "lifetime")) {
+            best = entry;
+            bestKeyString = key;
+        }
+    }
+
+    if (!best) {
+        return res.json({ hasValidKey: false, plan: null, expiresAt: null, key: null });
+    }
+
+    res.json({
+        hasValidKey: true,
+        plan: planOf(best),
+        expiresAt: best.expiresAt,
+        key: bestKeyString,
+    });
+});
+
+// --- Full key dump, for the bot's periodic 7-day-unused sweep (bot only) ---
+app.get("/keys/list", requireBotSecret, (req, res) => {
+    const keys = readKeys();
+    const list = Object.keys(keys).map((key) => ({ key, ...keys[key] }));
+    res.json({ keys: list });
 });
 
 // --- Validate a key (called by the mod) ---
