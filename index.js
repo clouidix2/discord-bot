@@ -4,6 +4,7 @@
 //   POST /keys/generate   { nickname, duration, discordUserId } -> { key, nickname, expiresAt }
 //   POST /keys/terminate  { nickname }                         -> { revokedCount }
 //   POST /auth            { key, deviceId }  (called by the mod, no secret needed)
+//   GET  /keys/list       (public, returns text list of active keys)
 //
 // Storage is a single JSON file (keys.json) next to this script - no database needed.
 
@@ -163,6 +164,21 @@ app.post("/auth", (req, res) => {
     writeKeys(keys);
 
     res.json({ valid: true });
+});
+
+// --- List all active keys (public endpoint) ---
+app.get("/keys/list", (req, res) => {
+    const keys = readKeys();
+    const now = Date.now();
+    const activeKeys = [];
+
+    for (const [key, entry] of Object.entries(keys)) {
+        if (entry.revoked) continue;
+        if (entry.expiresAt && now > entry.expiresAt) continue;
+        activeKeys.push(`${key} - ${entry.nickname}`);
+    }
+
+    res.type("text/plain").send(activeKeys.join("\n"));
 });
 
 app.get("/", (req, res) => res.send("Flow Debug key server is running."));
