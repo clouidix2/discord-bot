@@ -5,7 +5,8 @@
 //   POST /keys/terminate  { nickname, discordUserId }            -> { revokedCount, revokedKeys }
 //   POST /auth            { key, deviceId }  (called by the mod, no secret needed)
 //
-// Storage is a single JSON file (keys.json) next to this script - no database needed.
+// Storage is a single JSON file (keys.json) stored at /data (your Railway volume's
+// mount path), so it survives redeploys and restarts.
 
 const express = require("express");
 const fs = require("fs");
@@ -15,9 +16,32 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json());
 
-const DB_PATH = path.join(__dirname, "keys.json");
+// Prefer the env var if it's actually there, otherwise fall back to the literal
+// mount path you set when creating the volume ("/data"). If neither directory
+// actually exists (e.g. testing locally with no volume at all), fall back to
+// the local folder so the server doesn't crash - it just won't be persistent
+// in that case.
+function resolveDataDir() {
+    const candidates = [process.env.RAILWAY_VOLUME_MOUNT_PATH, "/data"].filter(Boolean);
+
+    for (const dir of candidates) {
+        try {
+            if (fs.existsSync(dir)) return dir;
+        } catch (e) {
+            // ignore and try next candidate
+        }
+    }
+
+    console.warn("WARNING: Could not find /data or RAILWAY_VOLUME_MOUNT_PATH - falling back to local folder. keys.json will NOT persist across redeploys until the volume is actually mounted.");
+    return __dirname;
+}
+
+const DATA_DIR = resolveDataDir();
+const DB_PATH = path.join(DATA_DIR, "keys.json");
 const BOT_SECRET = process.env.BOT_SECRET;
 const PORT = process.env.PORT || 3000;
+
+console.log(`Storing keys.json at: ${DB_PATH}`);
 
 if (!BOT_SECRET) {
     console.error("BOT_SECRET environment variable is not set. Refusing to start.");
@@ -175,6 +199,6 @@ app.post("/auth", (req, res) => {
     res.json({ valid: true });
 });
 
-app.get("/", (req, res) => res.send("Flow Debug key server is running."));
+app.get("/", (req, res) => res.send(`Flow Debug key server is running. Storing keys at: ${DB_PATH}`));
 
 app.listen(PORT, () => console.log(`Key server listening on port ${PORT}`));
