@@ -256,6 +256,17 @@ app.post("/auth", (req, res) => {
         return res.json({ valid: false, reason: "expired" });
     }
 
+    // Device-level lock: if this device is already bound to a DIFFERENT key,
+    // refuse - even if the key being tried right now is itself unused/valid.
+    // This is on top of the existing key-level lock below (a key can only
+    // ever bind to the first device that uses it).
+    for (const otherKeyString of Object.keys(keys)) {
+        if (otherKeyString === key) continue;
+        if (keys[otherKeyString].boundDeviceId === deviceId) {
+            return res.json({ valid: false, reason: "device_already_registered_to_another_key" });
+        }
+    }
+
     if (!entry.boundDeviceId) {
         entry.boundDeviceId = deviceId;
     } else if (entry.boundDeviceId !== deviceId) {
