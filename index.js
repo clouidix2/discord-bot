@@ -200,6 +200,24 @@ app.post("/keys/revoke-by-key", requireBotSecret, (req, res) => {
     res.json({ revoked: !wasAlreadyRevoked });
 });
 
+// --- Revoke every currently-valid key (bot only) ---
+// Records themselves are kept (still show up in /flowkey list, marked revoked)
+// rather than being deleted outright - this just invalidates everything at once.
+app.post("/keys/revoke-all", requireBotSecret, (req, res) => {
+    const keys = readKeys();
+    let revokedCount = 0;
+
+    for (const key of Object.keys(keys)) {
+        if (!keys[key].revoked) {
+            keys[key].revoked = true;
+            revokedCount++;
+        }
+    }
+
+    writeKeys(keys);
+    res.json({ revokedCount });
+});
+
 // --- Look up a user's current best key status (bot only) ---
 // Prefers a lifetime key over a monthly one if a user somehow has both.
 app.get("/keys/status/:discordUserId", requireBotSecret, (req, res) => {
@@ -237,6 +255,108 @@ app.get("/keys/list", requireBotSecret, (req, res) => {
     const keys = readKeys();
     const list = Object.keys(keys).map((key) => ({ key, ...keys[key] }));
     res.json({ keys: list });
+});
+
+// --- Clear a user's HWID lock, e.g. after they get a new PC (bot only) ---
+app.post("/keys/reset-hwid", requireBotSecret, (req, res) => {
+    const { discordUserId } = req.body || {};
+    if (!discordUserId) return res.status(400).json({ error: "discordUserId is required" });
+
+    const keys = readKeys();
+
+    let best = null;
+    let bestKeyString = null;
+    for (const key of Object.keys(keys)) {
+        const entry = keys[key];
+        if (entry.createdFor !== discordUserId) continue;
+        if (!isCurrentlyValid(entry)) continue;
+        if (!best || (planOf(entry) === "lifetime" && planOf(best) !== "lifetime")) {
+            best = entry;
+            bestKeyString = key;
+        }
+    }
+
+    if (!best) {
+        return res.status(404).json({ error: "no_valid_key" });
+    }
+
+    best.boundDeviceId = null;
+    writeKeys(keys);
+
+    res.json({ ok: true, key: bestKeyString });
+});
+
+// --- Extend a monthly key's expiry by another 30 days, stacking onto whatever
+// time is left rather than resetting from now (bot only) ---
+app.post("/keys/renew", requireBotSecret, (req, res) => {
+    const { discordUserId } = req.body || {};
+    if (!discordUserId) return res.status(400).json({ error: "discordUserId is required" });
+
+    const keys = readKeys();
+
+    let best = null;
+    let bestKeyString = null;
+    for (const key of Object.keys(keys)) {
+        const entry = keys[key];
+        if (entry.createdFor !== discordUserId) continue;
+        if (!isCurrentlyValid(entry)) continue;
+        if (!best || (planOf(entry) === "lifetime" && planOf(best) !== "lifetime")) {
+            best = entry;
+            bestKeyString = key;
+        }
+    }
+
+    if (!best) {
+        return res.status(404).json({ error: "no_valid_key" });
+    }
+
+    if (planOf(best) === "lifetime") {
+        return res.status(400).json({ error: "already_lifetime" });
+    }
+
+    const MS_30_DAYS = 30 * 24 * 60 * 60 * 1000;
+    // Extend from whichever is later: the key's current expiry, or now (in case
+    // it had somehow already lapsed before being renewed) - stacks remaining
+    // time rather than discarding it.
+    const base = Math.max(best.expiresAt, Date.now());
+    best.expiresAt = base + MS_30_DAYS;
+
+    writeKeys(keys);
+
+    res.json({ ok: true, key: bestKeyString, expiresAt: best.expiresAt });
+});
+
+// --- Aggregate counts across all keys (bot only) ---
+app.get("/keys/stats", requireBotSecret, (req, res) => {
+    const keys = readKeys();
+    const entries = Object.values(keys);
+
+    const stats = {
+        total: entries.length,
+        validLifetime: 0,
+        validMonthly: 0,
+        revoked: 0,
+        expired: 0,
+        unused: 0, // valid keys never yet bound to a device
+    };
+
+    for (const entry of entries) {
+        if (entry.revoked) {
+            stats.revoked++;
+            continue;
+        }
+        if (entry.expiresAt && Date.now() > entry.expiresAt) {
+            stats.expired++;
+            continue;
+        }
+
+        if (planOf(entry) === "lifetime") stats.validLifetime++;
+        else stats.validMonthly++;
+
+        if (!entry.boundDeviceId) stats.unused++;
+    }
+
+    res.json(stats);
 });
 
 // --- Validate a key (called by the mod) ---
